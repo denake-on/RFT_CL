@@ -1,0 +1,99 @@
+# ============================================================================
+# Random Baseline - 正式脚本 (A组: 随机选择)
+# 基于已跑通的 random_smoke.yaml, 放大到50步 + ckpt25步一存 + 结束导出HF + 加 MAD/ETR 记录
+# ----------------------------------------------------------------------------
+# 【红线·绝对不能改】rollouts n=16, max_prompt=4096, max_response=8192,
+#                    lr=1e-6, temp=1.0, GRPO clip=0.2
+# 【单卡适配·已验证】mode=colocate, engine_num=1, offload_policy=true,
+#                    max_token_len_per_gpu=12288
+# 【已定·三组一致】total_steps=50, batch_size=16, 不做途中val(离线用导出HF模型评测)
+# ============================================================================
+project: "BOTS-Selector"
+name: "qwen2.5-1.5B-instruct-random-full"
+mode: colocate              # 单卡: explorer 和 trainer 共享 GPU
+checkpoint_root_dir: /root/autodl-tmp/checkpoints
+
+# ★tensorboard 直写 /root/tf-logs (不走默认 checkpoint_job_dir/monitor, 也无需事后复制):
+#   events 实际落在 {cache_dir}/tensorboard/{trainer,explorer}/
+#   仅重定向 tensorboard; ckpt/state/log 仍在数据盘 checkpoint_job_dir 下
+monitor:
+  cache_dir: /root/tf-logs/random_full
+
+# ★关键: 加 pass_rate_calculator 算子, 才会计算并记录 selection/mad、selection/valid_ratio(ETR)
+#   随机选择器 feedback 是 no-op, 不影响选择行为, 仅用于统计 MAD/ETR (三组对比要同一把尺子)
+data_processor:
+  experience_pipeline:
+    operators:
+      - name: pass_rate_calculator
+
+algorithm:
+  algorithm_type: grpo
+  repeat_times: 16          # 论文值, 不能改 (每题 16 次 rollout -> 算 pass rate)
+  optimizer:
+    lr: 1e-6                # 论文值, 不能改
+
+model:
+  model_path: /root/autodl-tmp/models/Qwen2.5-1.5B-Instruct
+  max_prompt_tokens: 4096   # 论文值, 不能改
+  max_response_tokens: 8192 # 论文值, 不能改
+
+cluster:
+  node_num: 1
+  gpu_per_node: 1           # 单卡
+
+buffer:
+  total_epochs: 1
+  total_steps: 50           # 正式验证: 训 50 步 (三组一致)
+  batch_size: 16            # 三组一致 (已验证单卡可跑)
+  explorer_input:
+    taskset:
+      name: math-train
+      enable_progress_bar: true
+      storage_type: file
+      path: /root/autodl-tmp/data/guru-RL-92k/train_5k   # 5k 训练池 (含 bots 特征列)
+      split: 'train'
+      format:
+        prompt_key: 'prompt'
+        response_key: 'reward_model.ground_truth'
+      rollout_args:
+        temperature: 1.0    # 论文值, 不能改
+      data_selector:
+        selector_type: random   # ★A组=随机选择 (baseline)
+    # 本次小型验证: 不做途中在线评估 -> 移除 eval_tasksets (离线用导出的HF模型测benchmark)
+    #   如需恢复在线eval: 加回 eval_tasksets + explorer.eval_interval 调回10 + eval_on_startup:true
+    default_workflow_type: 'examples.bots.workflow.bots_math_boxed_workflow.BOTSMathBoxedWorkflow'
+  trainer_input:
+    experience_buffer:
+      name: exp_buffer
+      storage_type: queue
+      path: 'sqlite:///random_full_buffer.db'
+
+explorer:
+  eval_interval: 99999      # 不途中val(已移除eval_tasksets, 此值仅占位)
+  eval_on_startup: false    # ★不在step0评估(双保险: 即使有eval_tasksets也不评)
+  runner_per_model: 2       # 单卡缩小: 8->2
+  rollout_model:
+    engine_num: 1           # 单卡: 4->1
+    tensor_parallel_size: 1
+    enable_prefix_caching: false
+    enforce_eager: true
+    dtype: bfloat16
+    seed: 42
+
+synchronizer:
+  sync_method: 'nccl'
+  sync_interval: 4          # 单卡缩小: 8->4
+  sync_timeout: 1200
+
+trainer:
+  trainer_type: 'verl'
+  save_interval: 25         # ★25步一存: step25、step50 各存一次完整ckpt(~18G/个)
+  save_hf_checkpoint: last  # ★结束(final save)导出HF格式模型(~3G), 供后续benchmark测试用
+  max_checkpoints_to_keep: 2 # 保留step25+step50两个完整ckpt; 循环结束另有无条件final save兜底确保落盘
+  param_offload: true        # FSDP1 开关(本环境FSDP2不生效, 仅保留兼容)
+  optimizer_offload: true    # 同上
+  offload_policy: true       # ★FSDP2 CPU offload(本环境真正生效): 显存峰值35G->15.6G, 不改算法结果
+  grad_clip: 1.0
+  use_dynamic_bsz: true
+  max_token_len_per_gpu: 12288   # 砍 backward 峰值: =max_prompt4096+max_resp8192 的地板值, 不影响算法
+  ulysses_sequence_parallel_size: 1

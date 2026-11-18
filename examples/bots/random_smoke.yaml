@@ -1,0 +1,76 @@
+# Random Baseline - 烟测专用 (无评估)
+# 不能改的超参: rollouts n=16, max_prompt=4096, max_response=8192, lr=1e-6, temp=1.0
+project: "BOTS-Selector"
+name: "qwen2.5-1.5B-instruct-random-smoke"
+mode: colocate              # 单卡模式: explorer 和 trainer 共享 GPU
+checkpoint_root_dir: /root/autodl-tmp/checkpoints
+
+algorithm:
+  algorithm_type: grpo
+  repeat_times: 16          # 论文值，不能改
+  optimizer:
+    lr: 1e-6                # 论文值，不能改
+
+model:
+  model_path: /root/autodl-tmp/models/Qwen2.5-1.5B-Instruct
+  max_prompt_tokens: 4096   # 论文值，不能改
+  max_response_tokens: 8192 # 论文值，不能改
+
+cluster:
+  node_num: 1
+  gpu_per_node: 1           # 单卡
+
+buffer:
+  total_epochs: 1
+  total_steps: 5            # 烟测: 只跑5步
+  batch_size: 16            # 缩小: 256->16 (单卡适配)
+  explorer_input:
+    taskset:
+      name: math-train
+      enable_progress_bar: true   # 打开进度条(按样本数: batch_size×total_steps)
+      storage_type: file
+      path: /root/autodl-tmp/data/guru-RL-92k/train_5k  # 5k 子集目录
+      split: 'train'
+      format:
+        prompt_key: 'prompt'
+        response_key: 'reward_model.ground_truth'
+      rollout_args:
+        temperature: 1.0    # 论文值，不能改
+      data_selector:
+        selector_type: random
+    # 烟测: 移除 eval_tasksets 以跳过评估
+    default_workflow_type: 'examples.bots.workflow.bots_math_boxed_workflow.BOTSMathBoxedWorkflow'
+  trainer_input:
+    experience_buffer:
+      name: exp_buffer
+      storage_type: queue
+      path: 'sqlite:///random_smoke_buffer.db'
+
+explorer:
+  eval_interval: 9999       # 烟测: 跳过评估
+  runner_per_model: 2       # 缩小: 8->2
+  rollout_model:
+    engine_num: 1           # 缩小: 4->1 (单卡)
+    tensor_parallel_size: 1
+    enable_prefix_caching: false
+    enforce_eager: true
+    dtype: bfloat16
+    seed: 42
+
+synchronizer:
+  sync_method: 'nccl'
+  sync_interval: 4          # 缩小: 8->4
+  sync_timeout: 1200
+
+trainer:
+  trainer_type: 'verl'
+  save_interval: 9999       # 烟测: 不做周期性保存
+  save_hf_checkpoint: never  # 烟测: 不导出 HF 格式模型
+  max_checkpoints_to_keep: 1 # 最多留 1 个 ckpt, 防止数据盘爆(循环结束有一次无条件final save)
+  param_offload: true        # FSDP1 风格开关(本环境是 FSDP2, 这两个不生效, 仅保留兼容)
+  optimizer_offload: true    # FSDP1 风格开关(同上)
+  offload_policy: true       # ★FSDP2 的 CPU offload 开关(本环境 fsdp2 backend, 这个才生效): 参数/梯度/优化器态全 offload 到 CPU(90G内存), 不改算法结果
+  grad_clip: 1.0
+  use_dynamic_bsz: true
+  max_token_len_per_gpu: 12288   # 砍 backward 峰值: 24576->12288 (=max_prompt4096+max_resp8192 的地板值,不影响算法)
+  ulysses_sequence_parallel_size: 1

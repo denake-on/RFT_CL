@@ -1,0 +1,170 @@
+name: unittest
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  checks: write
+  pull-requests: write
+
+jobs:
+  unittest:
+    # only run on pull request
+    if: ${{ github.event.issue.pull_request && (startsWith(github.event.comment.body, '/unittest')) && (github.event.comment.author_association == 'COLLABORATOR' || github.event.comment.author_association == 'MEMBER' || github.event.comment.author_association == 'OWNER') }}
+    runs-on: self-hosted
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+        path: trinity-${{ github.run_id }}
+        ref: refs/pull/${{ github.event.issue.number }}/head
+
+    - name: Prepare docker env
+      working-directory: trinity-${{ github.run_id }}
+      run: |
+        DASHBOARD_PORT=$((10000 + (GITHUB_RUN_ID % 50000)))
+        cp .github/workflows/docker/env docker/env
+        sed -i "s/^TRINITY_RAY_DASHBOARD_PORT=.*/TRINITY_RAY_DASHBOARD_PORT=${DASHBOARD_PORT}/" docker/env
+
+    - name: Setup docker compose
+      working-directory: trinity-${{ github.run_id }}
+      run: |
+        bash docker/start.sh
+        sleep 15s
+
+    - name: Check ray status
+      working-directory: trinity-${{ github.run_id }}
+      run: |
+        MAX_RETRIES=20
+        RETRY_INTERVAL=5
+        for i in $(seq 1 $MAX_RETRIES); do
+          bash docker/status.sh | tee ray-status.txt
+          if grep -Fq "[trinity-node-1] Container is running and Ray is healthy." ray-status.txt \
+            && grep -Fq "[trinity-node-2] Container is running and Ray is healthy." ray-status.txt; then
+            break
+          fi
+          echo "Waiting for ray cluster to be ready... ($i/$MAX_RETRIES)"
+          sleep $RETRY_INTERVAL
+          if [ "$i" -eq "$MAX_RETRIES" ]; then
+            echo "Ray cluster failed to start after $MAX_RETRIES retries."
+            exit 1
+          fi
+        done
+
+    - name: Decide test type
+      id: test_type
+      working-directory: trinity-${{ github.run_id }}
+      run: |
+        COMMENT=$(printf '%s' "${{ github.event.comment.body }}" | tr -d '\r' | sed -n '1{s/[[:space:]]*$//;p;}')
+        if [[ "$COMMENT" == "/unittest-all"* ]]; then
+          echo "type=all" >> $GITHUB_OUTPUT
+        elif [[ "$COMMENT" == "/unittest-diff"* ]]; then
+          echo "type=diff" >> $GITHUB_OUTPUT
+        elif [[ "$COMMENT" =~ ^/unittest-module-(.+)$ ]]; then
+          MODULE="${COMMENT#/unittest-module-}"
+          echo "type=module" >> $GITHUB_OUTPUT
+          echo "module=$MODULE" >> $GITHUB_OUTPUT
+        elif [[ "$COMMENT" =~ ^/unittest-pattern-(.+)$ ]]; then
+          PATTERN="${COMMENT#/unittest-pattern-}"
+          echo "type=pattern" >> $GITHUB_OUTPUT
+          echo "pattern=$PATTERN" >> $GITHUB_OUTPUT
+        else
+          echo "type=all" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Get changed modules (for diff)
+      if: steps.test_type.outputs.type == 'diff'
+      id: diff
+      working-directory: trinity-${{ github.run_id }}
+      run: |
+        git fetch --depth=1 origin main
+        git diff --name-only origin/main HEAD > changed_files.txt
+        awk -F/ '/^(trinity|tests)\// {print $2}' changed_files.txt | sort | uniq > changed_modules.txt
+        : > test_dirs.txt
+        while read -r module; do
+          if [[ -n "$module" && -d "tests/$module" ]]; then
+            echo "tests/$module" >> test_dirs.txt
+          fi
+        done < changed_modules.txt
+
+    - name: Run unittest
+      working-directory: trinity-${{ github.run_id }}
+      run: |
+        source docker/common.sh
+        init_docker_compose
+        TYPE="${{ steps.test_type.outputs.type }}"
+        if [ "$TYPE" = "all" ]; then
+          echo "tests_run=true" >> $GITHUB_ENV
+          "${COMPOSE_CMD[@]}" exec trinity-node-1 bash -c "source /opt/venv/bin/activate && pytest tests -v -s --ctrf report.json"
+        elif [ "$TYPE" = "diff" ]; then
+          if [ -s test_dirs.txt ]; then
+            echo "tests_run=true" >> $GITHUB_ENV
+            TEST_DIRS=$(cat test_dirs.txt | xargs)
+            "${COMPOSE_CMD[@]}" exec trinity-node-1 bash -c "source /opt/venv/bin/activate && pytest $TEST_DIRS -v -s --ctrf report.json"
+          else
+            echo "No changed modules detected, skipping tests."
+            echo "tests_run=false" >> $GITHUB_ENV
+          fi
+        elif [ "$TYPE" = "module" ]; then
+          MODULE="${{ steps.test_type.outputs.module }}"
+          if [ -n "$MODULE" ] && [ -d "tests/$MODULE" ]; then
+            echo "tests_run=true" >> $GITHUB_ENV
+            "${COMPOSE_CMD[@]}" exec trinity-node-1 bash -c "source /opt/venv/bin/activate && pytest tests/$MODULE -v -s --ctrf report.json"
+          else
+            echo "No valid module specified, skipping tests."
+            echo "tests_run=false" >> $GITHUB_ENV
+          fi
+        elif [ "$TYPE" = "pattern" ]; then
+          PATTERN="${{ steps.test_type.outputs.pattern }}"
+          if [ -n "$PATTERN" ]; then
+            echo "tests_run=true" >> $GITHUB_ENV
+            "${COMPOSE_CMD[@]}" exec trinity-node-1 bash -c "source /opt/venv/bin/activate && pytest tests -v -s -k '$PATTERN' --ctrf report.json"
+          else
+            echo "No pattern specified, skipping tests."
+            echo "tests_run=false" >> $GITHUB_ENV
+          fi
+        fi
+
+    - name: Clean checkpoint dir
+      working-directory: trinity-${{ github.run_id }}
+      if: always()
+      run: |
+        source docker/common.sh
+        init_docker_compose
+        "${COMPOSE_CMD[@]}" exec trinity-node-1 rm -rf /mnt/checkpoints/*
+      continue-on-error: true
+
+    - name: Upload test results
+      if: env.tests_run == 'true' || failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: pytest-results
+        path: trinity-${{ github.run_id }}/report.json
+      continue-on-error: true
+
+    - name: Publish Test Report
+      if: env.tests_run == 'true' || failure()
+      uses: ctrf-io/github-test-reporter@v1
+      with:
+        report-path: trinity-${{ github.run_id }}/report.json
+        pull-request-report: true
+        issue: ${{ github.event.issue.number }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      continue-on-error: true
+
+    - name: Remove docker compose
+      working-directory: trinity-${{ github.run_id }}
+      if: always()
+      run: |
+        bash docker/stop.sh
+      continue-on-error: true
+
+    - name: Cleanup workspace
+      if: always()
+      run: |
+        rm -rf trinity-${{ github.run_id }} 2>/dev/null
+      continue-on-error: true

@@ -1,0 +1,100 @@
+# ============================================================================
+# BOTS 原版 - 烟测脚本 (B组: 难度选择, 只跑5步验证不崩)
+# 基于已跑通的 random_smoke.yaml, 换成 difficulty_based 选择器 + pass_rate_calculator
+# ----------------------------------------------------------------------------
+# 【红线·绝对不能改】rollouts n=16, max_prompt=4096, max_response=8192,
+#                    lr=1e-6, temp=1.0, p*(target_reward)=0.5, lamb=0.1, rho=0.1
+# 【单卡适配·已验证】mode=colocate, engine_num=1, offload_policy=true,
+#                    max_token_len_per_gpu=12288
+# 烟测目的: 确认 bots 选择器能读到特征列、feedback 能更新 Beta 后验、不 OOM
+# ============================================================================
+project: "BOTS-Selector"
+name: "qwen2.5-1.5B-instruct-bots-smoke"
+mode: colocate
+checkpoint_root_dir: /root/autodl-tmp/checkpoints
+
+# ★BOTS 必需: pass_rate_calculator 算出每题实测 pass rate -> 经 feedback 更新难度后验;
+#   同时记录 selection/mad、selection/valid_ratio(ETR). 没有这个算子, 选择器永远拿不到 feedback!
+data_processor:
+  experience_pipeline:
+    operators:
+      - name: pass_rate_calculator
+
+algorithm:
+  algorithm_type: grpo
+  repeat_times: 16          # 论文值, 不能改
+  optimizer:
+    lr: 1e-6                # 论文值, 不能改
+
+model:
+  model_path: /root/autodl-tmp/models/Qwen2.5-1.5B-Instruct
+  max_prompt_tokens: 4096   # 论文值, 不能改
+  max_response_tokens: 8192 # 论文值, 不能改
+
+cluster:
+  node_num: 1
+  gpu_per_node: 1
+
+buffer:
+  total_epochs: 1
+  total_steps: 5            # 烟测: 只跑5步
+  batch_size: 16            # 单卡适配
+  explorer_input:
+    taskset:
+      name: math-train
+      enable_progress_bar: true
+      storage_type: file
+      path: /root/autodl-tmp/data/guru-RL-92k/train_5k   # 5k 训练池 (已确认含两个 pass_rate 特征列)
+      split: 'train'
+      format:
+        prompt_key: 'prompt'
+        response_key: 'reward_model.ground_truth'
+      rollout_args:
+        temperature: 1.0    # 论文值, 不能改
+      data_selector:
+        selector_type: difficulty_based   # ★B组=BOTS 难度选择
+        # 复用 GURU 参考模型标签做锚点(零额外rollout): 弱=Qwen2.5-7B, 强=Qwen3-30B
+        feature_keys: [ "qwen2.5_7b_pass_rate", "qwen3_30b_pass_rate" ]
+        kwargs:
+          m: 16             # =repeat_times, 不能改
+          lamb: 0.1         # λ 历史折扣, 论文值, 不能改
+          rho: 0.1          # ρ 伪计数权重, 论文值, 不能改
+          target_reward: 0.5 # p* 目标难度, 论文值, 不能改
+          tau: 0            # 0=greedy top-k (论文设置)
+          do_sample: true   # Thompson 采样 Beta 后验
+    # 烟测: 不配 eval_tasksets, 跳过评估
+    default_workflow_type: 'examples.bots.workflow.bots_math_boxed_workflow.BOTSMathBoxedWorkflow'
+  trainer_input:
+    experience_buffer:
+      name: exp_buffer
+      storage_type: queue
+      path: 'sqlite:///bots_smoke_buffer.db'
+
+explorer:
+  eval_interval: 9999       # 烟测: 跳过评估
+  runner_per_model: 2       # 单卡缩小: 8->2
+  rollout_model:
+    engine_num: 1           # 单卡: 4->1
+    tensor_parallel_size: 1
+    enable_prefix_caching: false
+    enforce_eager: true
+    dtype: bfloat16
+    seed: 42
+
+synchronizer:
+  sync_method: 'nccl'
+  sync_interval: 4          # 单卡缩小: 8->4
+  sync_timeout: 1200
+
+trainer:
+  trainer_type: 'verl'
+  save_interval: 9999       # 烟测: 不做周期性保存
+  save_hf_checkpoint: never # 烟测: 不导出 HF
+  max_checkpoints_to_keep: 1 # 防止 final save 撑爆数据盘
+  param_offload: true        # FSDP1 开关(本环境FSDP2不生效, 仅保留兼容)
+  optimizer_offload: true    # 同上
+  offload_policy: true       # ★FSDP2 CPU offload(本环境真正生效): 显存峰值35G->15.6G
+  grad_clip: 1.0
+  use_dynamic_bsz: true
+  max_token_len_per_gpu: 12288   # 砍 backward 峰值(地板值), 不影响算法
+  ulysses_sequence_parallel_size: 1

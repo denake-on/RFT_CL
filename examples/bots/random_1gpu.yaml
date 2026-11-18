@@ -1,0 +1,78 @@
+# Random Baseline - 单卡 48G 适配版
+# 不能改的超参: rollouts n=16, max_prompt=4096, max_response=8192, lr=1e-6, temp=1.0
+project: "BOTS-Selector"
+name: "qwen2.5-1.5B-instruct-random-1gpu"
+mode: colocate              # 单卡模式: explorer 和 trainer 共享 GPU
+checkpoint_root_dir: /root/autodl-tmp/checkpoints
+
+algorithm:
+  algorithm_type: grpo
+  repeat_times: 16          # 论文值，不能改
+  optimizer:
+    lr: 1e-6                # 论文值，不能改
+
+model:
+  model_path: /root/autodl-tmp/models/Qwen2.5-1.5B-Instruct
+  max_prompt_tokens: 4096   # 论文值，不能改
+  max_response_tokens: 8192 # 论文值，不能改
+
+cluster:
+  node_num: 1
+  gpu_per_node: 1           # 单卡
+
+buffer:
+  total_epochs: 1
+  total_steps: 30           # 烟测: 30步 (论文100步)
+  batch_size: 16            # 缩小: 256->16 (单卡适配)
+  explorer_input:
+    taskset:
+      name: math-train
+      storage_type: file
+      path: /root/autodl-tmp/data/guru-RL-92k/train_5k  # 5k 子集目录
+      split: 'train'
+      format:
+        prompt_key: 'prompt'
+        response_key: 'reward_model.ground_truth'
+      rollout_args:
+        temperature: 1.0    # 论文值，不能改
+      data_selector:
+        selector_type: random
+    eval_tasksets:
+    - name: math-eval
+      storage_type: file
+      path: /root/autodl-tmp/data/guru-RL-92k/eval_math500  # eval 目录
+      format:
+        prompt_key: 'prompt'
+        response_key: 'reward_model.ground_truth'
+      rollout_args:
+        temperature: 1.0
+    default_workflow_type: 'examples.bots.workflow.bots_math_boxed_workflow.BOTSMathBoxedWorkflow'
+  trainer_input:
+    experience_buffer:
+      name: exp_buffer
+      storage_type: queue
+      path: 'sqlite:///random_trainer_buffer.db'
+
+explorer:
+  eval_interval: 9999       # 烟测: 跳过评估 (正式训练时改回 10)
+  runner_per_model: 2       # 缩小: 8->2
+  rollout_model:
+    engine_num: 1           # 缩小: 4->1 (单卡)
+    tensor_parallel_size: 1
+    enable_prefix_caching: false
+    enforce_eager: true
+    dtype: bfloat16
+    seed: 42
+
+synchronizer:
+  sync_method: 'nccl'
+  sync_interval: 4          # 缩小: 8->4
+  sync_timeout: 1200
+
+trainer:
+  trainer_type: 'verl'
+  save_interval: 50         # 缩小: 800->50
+  grad_clip: 1.0
+  use_dynamic_bsz: true
+  max_token_len_per_gpu: 24576
+  ulysses_sequence_parallel_size: 1
